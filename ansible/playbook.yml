@@ -1,0 +1,218 @@
+---
+- name: Task 1 - Disable Cloud-init on all routers
+  hosts: all
+  become: true
+  tasks:
+
+    # ------------------------------------------------------------------
+    # ЭТАП 1: Отключаем cloud-init, чтобы он не затирал наши конфиги
+    # ВСТАВЛЯТЬ СТРОГО В САМОЕ НАЧАЛО
+    # ------------------------------------------------------------------
+    
+    - name: Disable cloud-init network configuration
+      copy:
+        dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        content: |
+          network: {config: disabled}
+        owner: root
+        group: root
+        mode: '0644'
+      tags:
+        - cloud-init-disable
+      register: ci_disable_result
+
+    - name: Clean cloud-init network cache (автоматически убирает/очищает 50-cloud-init.yaml)
+      command: cloud-init clean -c network
+      changed_when: false
+      tags:
+        - cloud-init-disable
+      when: ci_disable_result.changed or ci_disable_result is succeeded
+
+    # ------------------------------------------------------------------
+
+- name: Play 2 - Set up NAT on router1
+  hosts: all
+  become: true
+  tasks:
+    - name: Set up NAT on router1
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - src: "iptables_rules.ipv4"
+          dest: "/etc/iptables_rules.ipv4"
+          mode: "0644"
+      when: inventory_hostname == "router1"
+
+    - name: Create systemd unit for applying NAT rules
+      copy:
+        content: |
+          [Unit]
+          Description=Apply iptables NAT rules
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c "/sbin/iptables-restore < /etc/iptables_rules.ipv4"
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/iptables-nat.service
+        owner: root
+        group: root
+        mode: "0644"
+      when: inventory_hostname == "router1"
+
+    - name: Enable and start iptables-nat service
+      systemd:
+        name: iptables-nat
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: inventory_hostname == "router1"
+
+
+- name: Play 3 - Disable ufw firewall and Enable packets forwarding
+  hosts: all
+  become: true
+  tasks:
+  #Отключаем UFW и удаляем его из автозагрузки
+  - name: disable ufw service
+    service:
+      name: ufw
+      state: stopped
+      enabled: false
+
+  # Включаем маршрутизацию транзитных пакетов
+  - name: set up forward packages across routers
+    sysctl:
+      name: net.ipv4.conf.all.forwarding
+      value: '1'
+      state: present
+
+
+- name: Play 4 - Install and configure FRR
+  hosts: all
+  become: true
+  tasks:
+  # Каталог /etc/apt/keyrings создаём, если его нет
+  - name: ensure keyrings dir exists
+    ansible.builtin.file:
+      path: "/etc/apt/keyrings"
+      state: directory
+      mode: "0755"
+
+  # Скачиваем ключ репозитория FRR
+  - name: download frr gpg key
+    ansible.builtin.get_url:
+      url: "https://deb.frrouting.org/frr/keys.asc"
+      dest: "/etc/apt/keyrings/frr-ascii.asc"
+      mode: "0644"
+
+  # Разармориваем ключ в бинарный keyring
+  - name: dearmor frr gpg key
+    ansible.builtin.command:
+      cmd: "gpg --dearmor -o /etc/apt/keyrings/frr.gpg /etc/apt/keyrings/frr-ascii.asc"
+      creates: "/etc/apt/keyrings/frr.gpg"
+
+  - name: add frr repo
+    ansible.builtin.apt_repository:
+      repo: "deb [signed-by=/etc/apt/keyrings/frr.gpg] https://deb.frrouting.org/frr {{ ansible_distribution_release }} frr-stable"
+      state: present
+
+  
+  # Обновляем пакеты и устанавливаем FRR
+  - name: install FRR packages
+    apt:
+      name: 
+        - frr
+        - frr-pythontools
+      state: present
+      update_cache: true
+
+  # Включаем маршрутизацию транзитных пакетов
+  - name: set up forward packages across routers
+    sysctl:
+      name: net.ipv4.conf.all.forwarding
+      value: '1'
+      state: present
+  
+  # Копируем файл daemons на хосты, указываем владельца и права
+  - name: base set up OSPF 
+    template:
+      src: daemons
+      dest: /etc/frr/daemons
+      owner: frr
+      group: frr
+      mode: 0640
+
+  # Копируем файлы frr.conf на хосты, указываем владельца и права
+  - name: add frr configurations to each host
+    template:
+      src: "frr-{{ inventory_hostname }}.conf"
+      dest: "/etc/frr/frr.conf"
+      owner: frr
+      group: frr
+      mode: "0640"
+
+  # Перезапускам FRR и добавляем в автозагрузку
+  - name: restart FRR
+    service:
+      name: frr
+      state: restarted
+      enabled: true
+
+
+- name: Play 5 - Disable default route (except router1)
+  hosts: all
+  become: true
+  tasks:
+    - name: disable default route
+      template:
+        src: "01-netcfg.yaml"
+        dest: "/etc/netplan/01-netcfg.yaml"
+        owner: root
+        group: root
+        mode: "0644"
+      when: inventory_hostname != "router1"
+    #  when: inventory_hostname not in ["inetRouter", "inetRouter2"]
+
+    # netplan try интерактивен и будет висеть. Для автоматизации используем apply.
+    # С try плейбук не пройдёт без ручного подтверждения.
+    - name: apply netplan config
+      command: netplan apply
+      when: inventory_hostname != "router1"
+
+
+- name: Play 6 - Reboot hosts
+  hosts: all
+  become: true
+  tasks:
+
+    - name: restart all hosts
+      reboot:
+        reboot_timeout: 600
+
+
+- name: Play 7 - Install traceroute
+  hosts: all
+  become: true
+  tasks:
+    - name: wait for OSPF default route
+      command: ip route show default
+      register: rt
+      until: "rt.stdout | length > 0"
+      retries: 12
+      delay: 10
+      when: inventory_hostname != "router1"
+
+    - name: Install traceroute
+      apt:
+        name: traceroute
+        state: present
+        update_cache: true
+
